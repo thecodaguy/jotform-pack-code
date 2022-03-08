@@ -1,0 +1,359 @@
+
+import * as coda from "@codahq/packs-sdk";
+export const pack = coda.newPack();
+pack.addNetworkDomain("jotform.com");
+pack.setUserAuthentication({
+  type: coda.AuthenticationType.QueryParamToken,
+  paramName: "apikey",
+  instructionsUrl: "https://www.jotform.com/myaccount/api"
+});
+pack.addFormula({
+  name: "DeleteSubmission",
+  description: "Delete a form submission using it's unique ID",
+  parameters: [
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "submissionID",
+      description: "The ID of the sumbission you are attempting to delete (Can be found under the ID column in a forms sync table)",
+    }),
+  ],
+  resultType: coda.ValueType.String,
+  isAction: true,
+  execute: async function ([submissionID], context) {
+    let response = await context.fetcher.fetch({
+      url: `https://api.jotform.com/submission/${submissionID}`,
+      method: "DELETE",
+  })
+  return "Submission deleted - Refresh table to view updated submissions"
+}});
+const formSchema = coda.makeObjectSchema({
+  properties: {
+    id: {type: coda.ValueType.String},
+    created_at: {type: coda.ValueType.String, codaType: coda.ValueHintType.Date},
+    updated_at: {type: coda.ValueType.String, codaType: coda.ValueHintType.Date},
+    username: {type: coda.ValueType.String},
+    title: {type: coda.ValueType.String},
+    status: {type: coda.ValueType.String},
+    last_submission: {type: coda.ValueType.String,codaType: coda.ValueHintType.Date},
+    submissions: {type: coda.ValueType.Number,fromKey: "count"},
+    url: {type: coda.ValueType.String, codaType: coda.ValueHintType.Url},
+    unread_submissions: {type: coda.ValueType.Number, fromKey: "new"}
+  },
+  primary: "title",
+  id: "id",
+  featured: ["created_at","title","status","submissions","unread_submissions","url",],
+  identity: {
+    name: "Form"
+  }
+})
+
+pack.addSyncTable({
+  name: "Forms",
+  schema: formSchema,
+  identityName: "Form",
+  formula: {
+    name: "SyncForm",
+    description: "Sync the meta-data for all your forms such as submission numbers, status, and other data",
+    parameters: [],
+    execute: async function ([],context){
+      let url = "https://api.jotform.com/user/forms"
+      let response = await context.fetcher.fetch({
+        method: "GET",
+        url: url
+      });
+      let items = response.body.content;
+      /*
+      for (let item of items){
+        item.id = item.content.id,
+        item.title = item.content.title
+      }*/
+      return { 
+        result: items
+      }
+    }
+  }
+})
+async function getForm(context, formId) {
+  let response = await context.fetcher.fetch({
+    method: "GET",
+    url: `https://api.jotform.com/form/${formId}`,
+    cacheTtlSecs: 0,
+  });
+  return response.body;
+}
+/*const getForm = async function (context: coda.SyncExecutionContext, formId){
+      let url = `https://api.jotform.com/form/${formId}`
+      let response = await context.fetcher.fetch({
+        method: "GET",
+        url: url
+      });
+      let items = response.body;
+      return { 
+        result: items
+      }
+    }*/
+const isQuestion = ["control_textbox",
+  "control_textarea",
+  "control_dropdown",
+  "control_radio",
+  "control_checkbox",
+  "control_fileupload",
+  "control_fullname",
+  "control_email",
+  "control_address",
+  "control_phone",
+  "control_datetime",
+  "control_time", //string
+  "control_birthdate",
+  "control_number",
+  "control_rating",
+  "control_scale",
+  "control_grading",
+  "control_slider",
+  "control_range",
+  "control_spinner",
+  "control_matrix",
+  "control_text",
+  "control_inline",
+  "control_signature",
+  "control_paypal"]
+pack.addDynamicSyncTable({
+  name: "Responses",
+  description: "Sync all the submissions for a selected form",
+  listDynamicUrls: async function (context) {
+   let response = await context.fetcher.fetch({
+      method: "GET",
+      url: "https://api.jotform.com/user/forms",
+    });
+    let forms = response.body.content;
+    let results = [];
+    for (let form of forms) {
+      results.push({
+        display: form.title,
+        value: `https://api.jotform.com/form/${form.id}`, 
+      });
+    }
+    return results;
+  },
+  getName: async function (context) { 
+    let formUrl = context.sync.dynamicUrl; 
+    let response = await context.fetcher.fetch({
+      method: "GET",
+      url: formUrl
+    })
+    //let form = await getForm(context, formUrl); //is getForm a function that I need to define? Where in the hell would I define that?
+    return response.body.content.title;
+  },
+  getSchema: async function (context) { 
+    let datasourceUrl = context.sync.dynamicUrl!;
+    let response = await context.fetcher.fetch({
+      method: "GET",
+      url: `${datasourceUrl}/questions` 
+    })
+    let formQuestions = response.body.content;
+     let properties: coda.ObjectSchemaProperties = {
+      created_at: {
+        type: coda.ValueType.String,
+        codaType: coda.ValueHintType.DateTime,
+      },
+      id: {
+        type: coda.ValueType.String,
+      },
+    };
+    let id = "id";
+    let primary = "created_at";
+    // For each field in the form, add a property to the schema.
+    let featured = [];
+    for (let question of Object.values(formQuestions)) { 
+      if (isQuestion.includes(question["type"])){ 
+      let nameRaw = question["text"];
+      let name = nameRaw.replace(/<[^>]+>|nbsp/g, '')
+      // Generate a schema for the field and add it to the set of properties.
+      properties[name] = getPropertySchema(question);
+      featured.push(name);
+      }
+    };
+    console.log(properties);
+    return coda.makeSchema({ 
+      type: coda.ValueType.Array,
+      items: coda.makeObjectSchema({
+        identity: {
+          name: "Response", 
+          dynamicUrl: datasourceUrl,
+        },
+        properties: properties,
+        id: id,
+        primary: primary,
+        featured: featured,
+      }),
+    });
+  },
+  getDisplayUrl: async function (context) { 
+    let sourceFrom = context.sync.dynamicUrl!
+    let response = await context.fetcher.fetch({
+      method: "GET",
+      url: sourceFrom
+    });
+    let myId = response.body.content.id
+    return `https://www.jotform.com/build/${myId}`
+  },
+  formula: {
+    name: "SyncResponses",
+    description: "Syncing all responses for chose form",
+    parameters: [],
+    execute: async function ([], context) {
+      let datasourceUrl = context.sync.dynamicUrl!;
+      let url = `${datasourceUrl}/submissions`;
+      let response = await context.fetcher.fetch({
+        method: "GET",
+        url: url,
+      });
+      let items = response.body.content.map(x => {
+        let item = {id: x.id, created_at: x.created_at}
+        Object.values(x.answers).forEach((answer: any) => {
+          if("answer" in answer === true){
+          if (answer["type"] === "control_fullname"){
+            item[answer.text] = answer.prettyFormat 
+          } else if (answer["type"] === "control_email"){
+            item[answer.text] = answer.answer
+          } else if (answer["type"] === "control_textbox"){
+            item[answer.text] = answer.answer.replace(/&#(\d+);/g, function (m, n) { return String.fromCharCode(n); })
+          } else if (answer["type"] === "control_textarea"){
+            item[answer.text] = answer.answer.replace(/&#(\d+);/g, function (m, n) { return String.fromCharCode(n); })
+          }else if (answer["type"] === "control_radio"){
+            item[answer.text] = answer.answer
+          } else if (answer["type"] === "control_phone"){
+            item[answer.text] = answer.answer
+          } else if (answer["type"] === "control_address"){
+            item[answer.text] = answer.answer
+          }else if (answer["type"] === "control_datetime"){
+            item[answer.text] = answer.prettyFormat
+          }else if (answer["type"] === "control_time"){
+            item[answer.text] = `${answer.answer.timeInput} ${answer.answer.ampm}`
+          }else if (answer["type"] === "control_birthdate"){
+            item[answer.text] = answer.answer.month + " "+answer.answer.day+", "+answer.answer.year
+          } else if (answer["type"] === "control_dropdown"){
+            item[answer.text] = answer.answer
+          }
+            else if (answer["type"] === "control_signature"){
+                item[answer.text] = answer.answer
+          }
+           else if (answer["type"] === "control_number"){
+            item[answer.text] = answer.answer
+          } else if (answer["type"] === "control_rating"){
+            item[answer.text] = answer.answer
+          } else if (answer["type"] === "control_scale"){
+            item[answer.text] = answer.answer
+          } else if (answer["type"] === "control_spinner"){
+            item[answer.text] = answer.answer
+          }else if (answer["type"] === "control_matrix"){
+            item[answer.text] = answer.prettyFormat
+          }else if (answer["type"] === "control_paypal"){
+            item[answer.text] = answer.prettyFormat
+          }
+          else {
+            item[answer.text] = answer.answer
+          }
+        }})
+        return item
+      }); 
+      
+      return {
+        result: items,
+      };
+    },
+  },
+});
+function getPropertySchema(question) {
+  let schema: any = {
+    description: question.text
+  };
+  switch (question.type) {
+    case "control_textbox":
+    case "control_textarea":
+    case "control_dropdown":
+    case "control_radio":
+    case "control_email":
+    case "control_phone":
+      schema.type = coda.ValueType.String
+      break;
+    case "control_paypal":
+      schema.type = coda.ValueType.String
+      schema.codaType = coda.ValueHintType.Html
+      break;
+    case "control_checkbox":
+      schema.type = coda.ValueType.Array;
+        schema.items = {
+          type: coda.ValueType.String,
+        };
+        break;
+    case "control_inline":
+    case "control_address":
+      schema.type = coda.ValueType.Object;
+        schema.properties = {
+          "cc_firstName": {type: coda.ValueType.String},
+          "cc_lastName": {type: coda.ValueType.String},
+          "cc_number": {type: coda.ValueType.String},
+          "cc_ccv": {type: coda.ValueType.String},
+          "cc_exp_month": {type: coda.ValueType.String},
+          "cc_exp_year": {type: coda.ValueType.String},
+          "addr_line1": {type: coda.ValueType.String},
+          "addr_line2": {type: coda.ValueType.String},
+          "city": {type: coda.ValueType.String},
+          "state": {type: coda.ValueType.String},
+          "postal": {type: coda.ValueType.String},
+          "country": {type: coda.ValueType.String}
+        }
+        schema.primary = "addr_line1"
+        break;
+    case "control_fullname":
+      schema.type = coda.ValueType.Object;
+          schema.properties = {
+            "prefix": {type: coda.ValueType.String},
+            "first": {type: coda.ValueType.String},
+            "middle": {type: coda.ValueType.String},
+            "last": {type: coda.ValueType.String},
+            "suffix": {type: coda.ValueType.String}
+          };
+          schema.primary = "first"
+          break;
+    case "control_matrix": //possibly need to erase this mother trucker
+      schema.type = coda.ValueType.String
+      schema.codaType = coda.ValueHintType.Html
+        break;
+    case "control_datetime":
+      schema.type = coda.ValueType.String
+      schema.codaType = coda.ValueHintType.DateTime
+      break; // Do i need to make this an object?
+    case "control_time": //this also might need to be an object??
+      schema.type = coda.ValueType.String
+      schema.codaType = coda.ValueHintType.Time
+      break;
+    case "control_birthdate":
+      schema.type = coda.ValueType.Object;
+          schema.properties = {
+            "month": {type: coda.ValueType.String},
+            "day": {type: coda.ValueType.String},
+            "year": {type: coda.ValueType.String},
+          };
+          schema.primary = "month"
+          break;
+    case "control_signature":
+      schema.type = coda.ValueType.String;
+      schema.codaType = coda.ValueHintType.Attachment
+      break;
+    case "control_number":
+    case "control_rating":
+    case "control_scale":
+    case "control_spinner":
+      schema.type = coda.ValueType.Number
+      break;
+    default:
+      
+      schema.type = coda.ValueType.String;
+  }
+  return schema;
+}
+function getPropertyKey(question) {
+  return question.id;
+}
